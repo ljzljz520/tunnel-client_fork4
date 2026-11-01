@@ -206,6 +206,13 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 				}
 
 				retryBackoff := retryPolicy.backoff()
+				// discoveryGeneration stamps successful catalog snapshots in
+				// publication order. The Harpoon registrar reconciles by
+				// generation, so a delayed older snapshot can never overwrite
+				// a newer admitted catalog. Failed attempts publish no
+				// snapshot and therefore neither consume a generation nor
+				// revoke the previous catalog.
+				discoveryGeneration := uint64(0)
 				// Retry the full discovery sequence with a fresh timeout so a
 				// transient startup failure can observe recovered probe and metadata
 				// endpoints without terminally settling readiness.
@@ -320,6 +327,11 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 						completeStartupCatalog(err)
 						logger.ErrorContext(fetchCtx, "OAuth discovery bundle build failed", slog.String("error", err.Error()))
 					} else {
+						discoveryGeneration++
+						bundle.Snapshot = &hostbus.BundleSnapshot{
+							Source:     hostbus.SourceOAuth,
+							Generation: discoveryGeneration,
+						}
 						logDiscoveredURLs(logger, bundle)
 						if err := publishDiscoveredBundle(bundle); err != nil {
 							completeStartupCatalog(err)

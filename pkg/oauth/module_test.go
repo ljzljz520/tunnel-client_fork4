@@ -231,6 +231,15 @@ func TestOAuthDiscoveryPublishesPRMDBundle(t *testing.T) {
 	if len(bus.bundles[0].URLs) != 10 {
 		t.Fatalf("expected 10 urls, got %d", len(bus.bundles[0].URLs))
 	}
+	if bus.bundles[0].Snapshot == nil {
+		t.Fatalf("expected successful discovery to publish a reconciliation snapshot")
+	}
+	if got := bus.bundles[0].Snapshot.Source; got != hostbus.SourceOAuth {
+		t.Fatalf("expected snapshot source %q, got %q", hostbus.SourceOAuth, got)
+	}
+	if got := bus.bundles[0].Snapshot.Generation; got != 1 {
+		t.Fatalf("expected first snapshot generation 1, got %d", got)
+	}
 	roles := make(map[string]bool, len(bus.bundles[0].URLs))
 	for _, record := range bus.bundles[0].URLs {
 		if record.UnixSocketPath != mcpUnixSocketPath {

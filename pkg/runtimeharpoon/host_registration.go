@@ -23,7 +23,7 @@ import (
 const autoRegistrationPrefix = "oauth"
 
 const (
-	oauthSource       = "oauth"
+	oauthSource       = hostbus.SourceOAuth
 	rolePRMDResource  = "prmd-resource"
 	rolePRMDSource    = "prmd-source"
 	registrationScope = "oauth-protected-resource-host"
@@ -208,6 +208,15 @@ func registerHostBundle(bundle hostbus.URLBundle, classifier *hostclassifier.Hos
 	if logger == nil {
 		return errors.New("logger is required")
 	}
+	if bundle.Snapshot == nil {
+		// Bundles without a snapshot keep the historical additive behavior so
+		// startup barrier ticks and legacy publishers never revoke targets.
+		return registerHostBundleAdditive(bundle, classifier, registry, logger)
+	}
+	return reconcileHostBundleSnapshot(bundle, classifier, registry, logger)
+}
+
+func registerHostBundleAdditive(bundle hostbus.URLBundle, classifier *hostclassifier.HostClassifier, registry *Registry, logger *slog.Logger) error {
 	oauthPolicy := newOAuthProtectedResourceHostPolicy(bundle)
 	for idx, record := range bundle.URLs {
 		if record.URL == nil {
@@ -300,6 +309,197 @@ func registerHostBundle(bundle hostbus.URLBundle, classifier *hostclassifier.Hos
 		)
 	}
 	return nil
+}
+
+// admittedHostRecord pairs a snapshot candidate with the logging context of
+// the bundle record it was derived from.
+type admittedHostRecord struct {
+	record    hostbus.URLRecord
+	target    Target
+	baseLabel string
+	role      string
+	source    string
+	group     string
+	reason    string
+}
+
+// reconcileHostBundleSnapshot applies one complete generation-ordered catalog
+// snapshot. The registry swap is atomic: callers only ever see the previous
+// complete catalog or the new one, endpoints missing from the snapshot lose
+// invocation, redirect, and rewriting eligibility, while operator targets and
+// other sources survive. Older generations are ignored without mutating the
+// catalog. A snapshot whose records admit no targets still revokes every
+// target the source previously owned; failed discoveries never reach this
+// point because publishers send no snapshot for them.
+func reconcileHostBundleSnapshot(
+	bundle hostbus.URLBundle,
+	classifier *hostclassifier.HostClassifier,
+	registry *Registry,
+	logger *slog.Logger,
+) error {
+	snapshot := bundle.Snapshot
+	oauthPolicy := newOAuthProtectedResourceHostPolicy(bundle)
+	admitted := admitHostBundleRecords(bundle, classifier, oauthPolicy, logger)
+
+	candidates := make([]Target, 0, len(admitted))
+	for _, entry := range admitted {
+		candidates = append(candidates, entry.target)
+	}
+
+	result, err := registry.ReplaceSourceTargets(snapshot.Source, snapshot.Generation, candidates)
+	if err != nil {
+		// The swap is all-or-nothing: the previous complete catalog stays
+		// live, and the publisher's acknowledgement only proves processing,
+		// not admission, so report and keep serving the retained generation.
+		logger.Error("harpoon host snapshot reconciliation failed; previous catalog retained",
+			slog.String("source", normalizeToken(snapshot.Source)),
+			slog.Uint64("generation", snapshot.Generation),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	if result.Stale {
+		logger.Info("harpoon host snapshot ignored: older or equal generation",
+			slog.String("source", result.Source),
+			slog.Uint64("generation", snapshot.Generation),
+		)
+		return nil
+	}
+
+	skipped := make(map[int]struct{}, len(result.Skipped))
+	for _, skip := range result.Skipped {
+		skipped[skip.Index] = struct{}{}
+		entry := admitted[skip.Index]
+		attrs := []any{
+			slog.String("label", skip.Label),
+			slog.String("url", tclog.RedactURL(entry.record.URL)),
+			slog.String("source", entry.source),
+			slog.String("role", entry.role),
+			slog.String("group", entry.group),
+			slog.String("inclusion_reason", entry.reason),
+			slog.String("error", skip.Err.Error()),
+		}
+		if entry.reason == "loopback" && strings.EqualFold(entry.record.URL.Scheme, "http") && !registry.allowPlaintext {
+			attrs = append(attrs, slog.String("remediation", loopbackPlaintextRemediation))
+		}
+		logger.Warn("harpoon host auto-registration failed", attrs...)
+	}
+
+	added := make(map[string]struct{}, len(result.AddedLabels))
+	for _, label := range result.AddedLabels {
+		added[label] = struct{}{}
+	}
+	labelIdx := 0
+	for candidateIdx, entry := range admitted {
+		if _, isSkipped := skipped[candidateIdx]; isSkipped {
+			continue
+		}
+		label := result.Labels[labelIdx]
+		labelIdx++
+		if label != entry.baseLabel {
+			logger.Info("harpoon host auto-registration resolved label collision",
+				slog.String("base_label", entry.baseLabel),
+				slog.String("label", label),
+			)
+		}
+		attrs := []any{
+			slog.String("label", label),
+			slog.String("url", tclog.RedactURL(entry.record.URL)),
+			slog.String("source", entry.target.Source),
+			slog.String("role", entry.role),
+			slog.String("group", entry.group),
+			slog.String("inclusion_reason", entry.reason),
+		}
+		if _, isAdded := added[label]; isAdded {
+			logger.Info("harpoon host auto-registered", attrs...)
+		} else {
+			logger.Debug("harpoon host auto-registration retained across snapshot", attrs...)
+		}
+	}
+	for _, label := range result.RevokedLabels {
+		logger.Info("harpoon host auto-registration revoked",
+			slog.String("label", label),
+			slog.String("source", result.Source),
+		)
+	}
+	logger.Info("harpoon host snapshot reconciled",
+		slog.String("source", result.Source),
+		slog.Uint64("generation", result.Generation),
+		slog.Int("target_count", registry.Count()),
+		slog.Int("admitted", len(result.Labels)),
+		slog.Int("added", len(result.AddedLabels)),
+		slog.Int("revoked", len(result.RevokedLabels)),
+		slog.Int("skipped", len(result.Skipped)),
+	)
+	return nil
+}
+
+// admitHostBundleRecords runs the shared classifier and OAuth protected-
+// resource host policy over a bundle, logging records that cannot be admitted
+// exactly like the additive registration path. Candidate labels are base
+// labels; the registry resolves collisions against the post-revocation catalog.
+func admitHostBundleRecords(
+	bundle hostbus.URLBundle,
+	classifier *hostclassifier.HostClassifier,
+	oauthPolicy oauthProtectedResourceHostPolicy,
+	logger *slog.Logger,
+) []admittedHostRecord {
+	admitted := make([]admittedHostRecord, 0, len(bundle.URLs))
+	for idx, record := range bundle.URLs {
+		if record.URL == nil {
+			logger.Info("harpoon host auto-registration skipped: missing url")
+			continue
+		}
+		role := tagValue(record.Tags, hostbus.TagKeyRole)
+		source := tagValue(record.Tags, hostbus.TagKeySource)
+		group := tagValue(record.Tags, hostbus.TagKeyGroup)
+		allowed, reason := shouldRegisterURLRecord(record, classifier, oauthPolicy)
+		if !allowed {
+			logger.Info("harpoon host auto-registration skipped: not allowed",
+				slog.String("url", tclog.RedactURL(record.URL)),
+				slog.String("host", record.URL.Hostname()),
+				slog.String("source", source),
+				slog.String("role", role),
+				slog.String("group", group),
+				slog.String("exclusion_reason", reason),
+			)
+			continue
+		}
+		baseLabel := buildAutoLabel(record, idx)
+		if baseLabel == "" {
+			logger.Warn("harpoon host auto-registration skipped: empty label",
+				slog.String("url", tclog.RedactURL(record.URL)),
+				slog.String("source", source),
+				slog.String("role", role),
+				slog.String("group", group),
+				slog.String("inclusion_reason", reason),
+			)
+			continue
+		}
+		tags := roleTags(role)
+		if normalizedGroup := normalizeToken(group); normalizedGroup != "" {
+			tags = append(tags, "group="+normalizedGroup)
+		}
+		admitted = append(admitted, admittedHostRecord{
+			record: record,
+			target: Target{
+				Label:           baseLabel,
+				Description:     record.Description,
+				Category:        source,
+				Source:          source,
+				Tags:            tags,
+				InclusionReason: reason,
+				BaseURL:         record.URL,
+				UnixSocketPath:  record.UnixSocketPath,
+			},
+			baseLabel: baseLabel,
+			role:      role,
+			source:    source,
+			group:     group,
+			reason:    reason,
+		})
+	}
+	return admitted
 }
 
 type oauthProtectedResourceHostPolicy struct {
@@ -476,7 +676,24 @@ func resolveAutoLabelCollision(baseLabel string, registry *Registry) (string, in
 	if baseLabel == "" || registry == nil {
 		return "", 0
 	}
+	registry.mu.RLock()
+	occupied := make(map[string]struct{}, len(registry.targets))
+	for label := range registry.targets {
+		occupied[label] = struct{}{}
+	}
+	registry.mu.RUnlock()
+	return resolveLabelAgainstOccupied(baseLabel, occupied)
+}
 
+// resolveLabelAgainstOccupied assigns baseLabel when free and otherwise
+// baseLabel-1, baseLabel-2, ... matching the historical collision scheme. The
+// reconcile path releases the source's previous labels before building the
+// occupied set, so identical snapshots keep identical labels instead of
+// accumulating numeric suffixes.
+func resolveLabelAgainstOccupied(baseLabel string, occupied map[string]struct{}) (string, int) {
+	if baseLabel == "" {
+		return "", 0
+	}
 	for i := range 10_000 {
 		candidate := baseLabel
 		if i > 0 {
@@ -485,7 +702,7 @@ func resolveAutoLabelCollision(baseLabel string, registry *Registry) (string, in
 		if candidate == "" {
 			continue
 		}
-		if _, exists := registry.Lookup(candidate); exists {
+		if _, exists := occupied[candidate]; exists {
 			continue
 		}
 		return candidate, i

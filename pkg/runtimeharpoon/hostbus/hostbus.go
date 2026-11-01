@@ -8,11 +8,37 @@ import (
 	"time"
 )
 
+// Discovery sources whose snapshots own a reconcile-managed target set.
+const (
+	// SourceOAuth identifies targets discovered through OAuth Protected
+	// Resource Metadata discovery.
+	SourceOAuth = "oauth"
+)
+
+// BundleSnapshot marks a bundle as a complete, generation-ordered catalog
+// snapshot for one discovery source. Subscribers reconcile snapshots by
+// atomically replacing the source's previously admitted target set: older
+// generations never overwrite newer ones, endpoints missing from a newer
+// snapshot are revoked, and targets owned by other sources are retained.
+// Bundles without a snapshot keep the historical additive registration
+// behavior, so barrier ticks and legacy publishers remain no-ops rather than
+// being mistaken for an intentionally empty catalog.
+type BundleSnapshot struct {
+	Source     string
+	Generation uint64
+}
+
 // URLBundle captures a set of URLs discovered by any component. It keeps
 // transport hints generic and intentionally avoids OAuth-specific fields.
 type URLBundle struct {
 	FetchedAt time.Time
 	URLs      []URLRecord
+
+	// Snapshot, when set, makes the bundle a complete source-owned catalog
+	// snapshot reconciled by generation instead of an additive update. A
+	// successful snapshot with no admitted URLs revokes every target the
+	// source previously owned.
+	Snapshot *BundleSnapshot
 
 	// ack is attached only by PublishAndWait. It stays private so URL bundles
 	// remain transport-neutral for ordinary publishers and subscribers.

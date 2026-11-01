@@ -64,6 +64,15 @@ type Registry struct {
 	stateCh           chan struct{}
 	discoveryBytes    int
 	hasRichTemplates  bool
+
+	// dynamicOwners maps labels introduced through source snapshot
+	// reconciliation to their owning source. Only these labels are revoked by
+	// a newer snapshot; operator config and other additive registrations stay
+	// outside the map and survive every reconciliation.
+	dynamicOwners map[string]string
+	// sourceGenerations records the last applied snapshot generation per
+	// source. Older or equal generations arriving out of order are ignored.
+	sourceGenerations map[string]uint64
 }
 
 // RegistryCounter is the minimal cross-package contract needed by polling and
@@ -136,6 +145,8 @@ func NewRegistryWithLimit(logger *slog.Logger, allowPlaintext bool, targets []Ta
 		explainCache:      make(map[string]redirectExplainCacheEntry),
 		explainCacheOrder: make([]string, 0, defaultRedirectExplainCacheLimit),
 		stateCh:           make(chan struct{}),
+		dynamicOwners:     make(map[string]string),
+		sourceGenerations: make(map[string]uint64),
 	}
 	for _, target := range targets {
 		if err := registry.RegisterTarget(target); err != nil {
@@ -145,52 +156,275 @@ func NewRegistryWithLimit(logger *slog.Logger, allowPlaintext bool, targets []Ta
 	return registry, nil
 }
 
-// RegisterTarget adds a target to the registry after validation.
-func (r *Registry) RegisterTarget(target Target) error {
+// SourceTargetSkip describes a snapshot candidate that could not join a
+// reconciled catalog. The remainder of the snapshot is still admitted; skips
+// mirror the per-record admission policy of additive registration.
+type SourceTargetSkip struct {
+	Index int
+	Label string
+	Err   error
+}
+
+// SourceReplacementResult reports the outcome of a snapshot reconciliation.
+type SourceReplacementResult struct {
+	// Applied reports whether the generation became the live catalog version.
+	// It is false for stale generations, in which case all other fields are
+	// empty.
+	Applied bool
+	// Stale identifies a generation at or below the source's already-applied
+	// generation. Stale snapshots never mutate the catalog.
+	Stale      bool
+	Source     string
+	Generation uint64
+	// Labels lists admitted labels in snapshot candidate order, including
+	// collision-resolved spellings.
+	Labels []string
+	// AddedLabels lists admitted labels that were not owned by this source in
+	// the previous catalog version.
+	AddedLabels []string
+	// RevokedLabels lists labels this source previously owned but the new
+	// snapshot no longer admits.
+	RevokedLabels []string
+	// Skipped lists candidates rejected during validation or collision checks.
+	Skipped []SourceTargetSkip
+}
+
+// ReplaceSourceTargets atomically reconciles the reconcile-managed targets
+// owned by source with the complete candidate set carried by one discovery
+// snapshot.
+//
+// Generation ordering: a generation at or below the source's already-applied
+// generation is ignored without touching the catalog, so an older discovery
+// arriving out of order can never overwrite newer results.
+//
+// On application every target previously introduced for source is revoked
+// and replaced by the snapshot's admitted targets in a single locked
+// transition. Invocation lookup, redirect allowlisting, and response URL
+// rewriting therefore never observe a half-rebuilt catalog. Targets created
+// through RegisterTarget (including operator config) and targets owned by
+// other sources are retained. A successful snapshot with no admitted targets
+// revokes every target the source previously owned.
+func (r *Registry) ReplaceSourceTargets(source string, generation uint64, candidates []Target) (SourceReplacementResult, error) {
 	if r == nil {
-		return errors.New("harpoon: registry is nil")
+		return SourceReplacementResult{}, errors.New("harpoon: registry is nil")
 	}
+	source = normalizeToken(source)
+	if source == "" {
+		return SourceReplacementResult{}, errors.New("harpoon: snapshot source is required")
+	}
+	result := SourceReplacementResult{Source: source, Generation: generation}
+
+	type preparedTarget struct {
+		index          int
+		target         Target
+		discoveryBytes int
+	}
+	prepared := make([]preparedTarget, 0, len(candidates))
+	// Validate every candidate outside the catalog lock. No catalog state
+	// changes until the whole replacement version is known to be constructible.
+	for idx, candidate := range candidates {
+		clean, discoveryBytes, err := r.prepareTarget(candidate)
+		if err != nil {
+			result.Skipped = append(result.Skipped, SourceTargetSkip{Index: idx, Label: strings.TrimSpace(candidate.Label), Err: err})
+			continue
+		}
+		prepared = append(prepared, preparedTarget{index: idx, target: clean, discoveryBytes: discoveryBytes})
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if previous, ok := r.sourceGenerations[source]; ok && generation <= previous {
+		result.Stale = true
+		return result, nil
+	}
+
+	previousOwned := make(map[string]struct{})
+	for label, owner := range r.dynamicOwners {
+		if owner == source {
+			previousOwned[label] = struct{}{}
+		}
+	}
+
+	// Retain everything this source does not own, preserving catalog order.
+	retained := make([]Target, 0, len(r.ordered))
+	occupiedLabels := make(map[string]struct{}, len(r.targets))
+	urlTransports := make(map[string]string)
+	retainedDiscoveryBytes := 0
+	retainedHasRichTemplates := false
+	for _, target := range r.ordered {
+		if owner, owned := r.dynamicOwners[target.Label]; owned && owner == source {
+			// Owned labels are provisionally released; labels the new
+			// snapshot re-admits are removed from the revoked set below.
+			continue
+		}
+		retained = append(retained, target)
+		occupiedLabels[target.Label] = struct{}{}
+		if target.template == nil && target.BaseURL != nil {
+			if key, err := normalizedURLKey(target.BaseURL); err == nil {
+				urlTransports[key] = target.UnixSocketPath
+			}
+		}
+		bytes, err := targetDiscoveryBytes(target)
+		if err != nil {
+			return SourceReplacementResult{}, errors.New("harpoon: cannot encode public target discovery")
+		}
+		retainedDiscoveryBytes += bytes
+		if target.template != nil && target.template.HasRichHeaderRules() {
+			retainedHasRichTemplates = true
+		}
+	}
+
+	// Resolve base labels only against retained targets and already-admitted
+	// snapshot members. Previously owned labels were released above, so a
+	// repeated discovery reuses the same labels instead of growing suffixes.
+	admitted := make([]preparedTarget, 0, len(prepared))
+	for _, candidate := range prepared {
+		base := candidate.target.Label
+		label, _ := resolveLabelAgainstOccupied(base, occupiedLabels)
+		if label == "" {
+			result.Skipped = append(result.Skipped, SourceTargetSkip{Index: candidate.index, Label: base, Err: errors.New("harpoon: no available target label")})
+			continue
+		}
+		candidate.target.Label = label
+		if candidate.target.template == nil {
+			key, err := normalizedURLKey(candidate.target.BaseURL)
+			if err != nil {
+				result.Skipped = append(result.Skipped, SourceTargetSkip{Index: candidate.index, Label: label, Err: fmt.Errorf("harpoon: target %q base URL is invalid: %w", label, err)})
+				continue
+			}
+			if existing, exists := urlTransports[key]; exists && existing != candidate.target.UnixSocketPath {
+				result.Skipped = append(result.Skipped, SourceTargetSkip{Index: candidate.index, Label: label, Err: fmt.Errorf("harpoon: duplicate target url %q uses a different transport", tclog.RedactURL(candidate.target.BaseURL))})
+				continue
+			}
+			urlTransports[key] = candidate.target.UnixSocketPath
+		}
+		occupiedLabels[label] = struct{}{}
+		admitted = append(admitted, candidate)
+		result.Labels = append(result.Labels, label)
+		if _, existed := previousOwned[label]; !existed {
+			result.AddedLabels = append(result.AddedLabels, label)
+		}
+	}
+
+	// A previously owned label is revoked only when the new snapshot does
+	// not re-admit it; re-admitted labels stay stable across generations.
+	admittedSet := make(map[string]struct{}, len(admitted))
+	for _, candidate := range admitted {
+		admittedSet[candidate.target.Label] = struct{}{}
+	}
+	for label := range previousOwned {
+		if _, ok := admittedSet[label]; !ok {
+			result.RevokedLabels = append(result.RevokedLabels, label)
+		}
+	}
+	slices.Sort(result.RevokedLabels)
+
+	if len(retained)+len(admitted) > r.limit {
+		return SourceReplacementResult{}, fmt.Errorf("harpoon: registry limit %d exceeded", r.limit)
+	}
+	discoveryBytes := retainedDiscoveryBytes
+	hasRichTemplates := retainedHasRichTemplates
+	for _, candidate := range admitted {
+		discoveryBytes += candidate.discoveryBytes
+		if candidate.target.template != nil && candidate.target.template.HasRichHeaderRules() {
+			hasRichTemplates = true
+		}
+	}
+	discoveryBytes = min(maxTemplateCatalogBytes+1, discoveryBytes)
+	if hasRichTemplates && discoveryBytes > maxTemplateCatalogBytes {
+		return SourceReplacementResult{}, errors.New("harpoon: structured-header discovery exceeds the 512 KiB catalog budget; reduce target metadata or split the catalog")
+	}
+
+	// All checks passed: publish one complete replacement version. Readers
+	// holding the read lock see either the previous catalog or this one.
+	newTargets := make(map[string]Target, len(retained)+len(admitted))
+	newOrdered := make([]Target, 0, len(retained)+len(admitted))
+	newURLKeys := make(map[string]struct{}, len(r.targetURLKeys))
+	newOwners := make(map[string]string, len(r.dynamicOwners)+len(admitted))
+	for label, owner := range r.dynamicOwners {
+		if owner != source {
+			newOwners[label] = owner
+		}
+	}
+	for _, target := range retained {
+		newTargets[target.Label] = target
+		newOrdered = append(newOrdered, target)
+		if target.template == nil {
+			if key, err := normalizedURLKey(target.BaseURL); err == nil {
+				newURLKeys[key] = struct{}{}
+			}
+		}
+	}
+	for _, candidate := range admitted {
+		target := candidate.target
+		newTargets[target.Label] = target
+		newOrdered = append(newOrdered, target)
+		newOwners[target.Label] = source
+		if target.template == nil {
+			if key, err := normalizedURLKey(target.BaseURL); err == nil {
+				newURLKeys[key] = struct{}{}
+			}
+		}
+	}
+
+	r.targets = newTargets
+	r.ordered = newOrdered
+	r.targetURLKeys = newURLKeys
+	r.dynamicOwners = newOwners
+	r.sourceGenerations[source] = generation
+	r.discoveryBytes = discoveryBytes
+	r.hasRichTemplates = hasRichTemplates
+	r.clearExplainCacheLocked()
+	r.signalStateChangeLocked()
+	result.Applied = true
+	return result, nil
+}
+
+// prepareTarget validates and normalizes one target without changing registry
+// state. It is shared by additive registration and snapshot reconciliation.
+func (r *Registry) prepareTarget(target Target) (Target, int, error) {
 	label := strings.TrimSpace(target.Label)
 	if label == "" {
-		return errors.New("harpoon: target label is required")
+		return Target{}, 0, errors.New("harpoon: target label is required")
 	}
 	if !labelPattern.MatchString(label) {
-		return fmt.Errorf("harpoon: invalid target label %q", label)
+		return Target{}, 0, fmt.Errorf("harpoon: invalid target label %q", label)
 	}
 	template := target.template
 	if target.Template != nil {
 		if target.BaseURL != nil || target.UnixSocketPath != "" {
-			return fmt.Errorf("harpoon: target %q cannot combine a template with an exact URL or socket", label)
+			return Target{}, 0, fmt.Errorf("harpoon: target %q cannot combine a template with an exact URL or socket", label)
 		}
 		var err error
 		template, err = CompileTargetTemplate(target.Template)
 		if err != nil {
-			return fmt.Errorf("harpoon: target %q: %w", label, err)
+			return Target{}, 0, fmt.Errorf("harpoon: target %q: %w", label, err)
 		}
 		// Origin is metadata only; template targets never enter exact routing.
 		origin := template.origin
 		target.BaseURL = &origin
 	}
 	if target.BaseURL == nil {
-		return fmt.Errorf("harpoon: target %q base URL is required", label)
+		return Target{}, 0, fmt.Errorf("harpoon: target %q base URL is required", label)
 	}
 	if target.BaseURL.Scheme == "" || target.BaseURL.Host == "" {
-		return fmt.Errorf("harpoon: target %q base URL must include scheme and host", label)
+		return Target{}, 0, fmt.Errorf("harpoon: target %q base URL must include scheme and host", label)
 	}
 	if !r.allowPlaintext && !isHTTPS(target.BaseURL) && (template == nil || !template.loopbackHTTP) {
-		return fmt.Errorf("harpoon: target %q base URL must use https", label)
+		return Target{}, 0, fmt.Errorf("harpoon: target %q base URL must use https", label)
 	}
 	escapedPath := target.BaseURL.EscapedPath()
 	if escapedPath != "" && !strings.HasPrefix(escapedPath, "/") {
-		return fmt.Errorf("harpoon: target %q base URL path must be absolute", label)
+		return Target{}, 0, fmt.Errorf("harpoon: target %q base URL path must be absolute", label)
 	}
 	if hasTraversal(target.BaseURL.Path) {
-		return fmt.Errorf("harpoon: target %q base URL contains invalid path segments", label)
+		return Target{}, 0, fmt.Errorf("harpoon: target %q base URL contains invalid path segments", label)
 	}
 
 	normalized, err := normalizeURL(target.BaseURL)
 	if err != nil {
-		return fmt.Errorf("harpoon: target %q base URL is invalid: %w", label, err)
+		return Target{}, 0, fmt.Errorf("harpoon: target %q base URL is invalid: %w", label, err)
 	}
 	original := *target.BaseURL
 
@@ -209,16 +443,29 @@ func (r *Registry) RegisterTarget(target Target) error {
 	}
 	discoveryBytes, err := targetDiscoveryBytes(cleanTarget)
 	if err != nil {
-		return errors.New("harpoon: cannot encode public target discovery")
+		return Target{}, 0, errors.New("harpoon: cannot encode public target discovery")
 	}
+	return cleanTarget, discoveryBytes, nil
+}
+
+// RegisterTarget adds a target to the registry after validation.
+func (r *Registry) RegisterTarget(target Target) error {
+	if r == nil {
+		return errors.New("harpoon: registry is nil")
+	}
+	cleanTarget, discoveryBytes, err := r.prepareTarget(target)
+	if err != nil {
+		return err
+	}
+	label := cleanTarget.Label
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.targets[label]; exists {
 		return fmt.Errorf("harpoon: duplicate target label %q", label)
 	}
-	if _, exists := r.targetURLKeys[normalized.String()]; template == nil && exists && r.hasDifferentTransportForURLLocked(normalized, cleanTarget.UnixSocketPath) {
-		return fmt.Errorf("harpoon: duplicate target url %q uses a different transport", tclog.RedactURL(normalized))
+	if _, exists := r.targetURLKeys[cleanTarget.BaseURL.String()]; cleanTarget.template == nil && exists && r.hasDifferentTransportForURLLocked(cleanTarget.BaseURL, cleanTarget.UnixSocketPath) {
+		return fmt.Errorf("harpoon: duplicate target url %q uses a different transport", tclog.RedactURL(cleanTarget.BaseURL))
 	}
 	if len(r.targets) >= r.limit {
 		return fmt.Errorf("harpoon: registry limit %d exceeded", r.limit)
@@ -227,7 +474,7 @@ func (r *Registry) RegisterTarget(target Target) error {
 	// legacy targets that share discovery with a rich-header template. Catalogs
 	// without structured rules retain their existing limits; saturated
 	// accounting prevents a later rich rule from activating an oversized one.
-	hasRichTemplates := r.hasRichTemplates || (template != nil && template.HasRichHeaderRules())
+	hasRichTemplates := r.hasRichTemplates || (cleanTarget.template != nil && cleanTarget.template.HasRichHeaderRules())
 	if hasRichTemplates && discoveryBytes > maxTemplateCatalogBytes-r.discoveryBytes {
 		return errors.New("harpoon: structured-header discovery exceeds the 512 KiB catalog budget; reduce target metadata or split the catalog")
 	}
@@ -235,8 +482,8 @@ func (r *Registry) RegisterTarget(target Target) error {
 	r.hasRichTemplates = hasRichTemplates
 	r.targets[label] = cleanTarget
 	r.ordered = append(r.ordered, cleanTarget)
-	if template == nil {
-		r.targetURLKeys[normalized.String()] = struct{}{}
+	if cleanTarget.template == nil {
+		r.targetURLKeys[cleanTarget.BaseURL.String()] = struct{}{}
 	}
 	r.clearExplainCacheLocked()
 	r.signalStateChangeLocked()

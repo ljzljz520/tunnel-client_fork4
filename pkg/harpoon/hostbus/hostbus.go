@@ -17,6 +17,7 @@ type TagKey = runtimehostbus.TagKey
 type Tag = runtimehostbus.Tag
 type HostRegistrationBus = runtimehostbus.HostRegistrationBus
 type StartupCatalogState = runtimehostbus.StartupCatalogState
+type BundleSnapshot = runtimehostbus.BundleSnapshot
 
 const (
 	TagKeyUnspecified = runtimehostbus.TagKeyUnspecified
@@ -24,6 +25,8 @@ const (
 	TagKeyRole        = runtimehostbus.TagKeyRole
 	TagKeyIndex       = runtimehostbus.TagKeyIndex
 	TagKeyGroup       = runtimehostbus.TagKeyGroup
+
+	SourceOAuth = runtimehostbus.SourceOAuth
 )
 
 // hostRegistrationBus is a thin full-client adapter around the runtime-owned
